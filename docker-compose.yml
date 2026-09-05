@@ -1,0 +1,13 @@
+services:
+  telegram-file-vault:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+      - "6881:6881"
+    volumes:
+      - seed-data:/data
+
+volumes:
+  seed-data:
