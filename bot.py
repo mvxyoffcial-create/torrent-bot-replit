@@ -13,7 +13,7 @@ import os
 import re
 import secrets
 import shutil
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,7 +80,7 @@ if not TRACKERS:
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 SEED_ENABLED = os.getenv("ENABLE_SEEDING", "true").lower() in {"1", "true", "yes"}
 SEED_PATH = Path(os.getenv("SEED_PATH", "/data/seeds"))
-SEED_MAX_ACTIVE = int_env("SEED_MAX_ACTIVE", 1)
+SEED_MAX_ACTIVE = int_env("SEED_MAX_ACTIVE", 0)
 SEED_PORT = int_env("SEED_PORT", 6881)
 
 
@@ -102,6 +102,8 @@ def validate_configuration() -> None:
         raise RuntimeError("Missing or invalid configuration: " + ", ".join(missing))
     if PIECE_LENGTH < 256 * 1024:
         raise RuntimeError("TORRENT_PIECE_LENGTH must be at least 262144 bytes")
+    if SEED_MAX_ACTIVE < 0:
+        raise RuntimeError("SEED_MAX_ACTIVE must be 0 or greater")
 
 
 def safe_filename(name: str | None) -> str:
@@ -164,26 +166,58 @@ def make_torrent_bytes(name: str, size: int, piece_hashes: bytes) -> tuple[bytes
     return torrent_bytes, info_hash, "&".join(magnet_parts)
 
 
-async def hash_telegram_file(message: Any, size: int) -> bytes:
-    """Create standard v1 torrent piece hashes without holding the file in RAM."""
+async def hash_telegram_file(
+    message: Any, size: int, cache_path: Path | None = None
+) -> bytes:
+    """Hash real torrent pieces and optionally cache the same stream for seeding."""
     hashes = bytearray()
     piece_buffer = bytearray()
     completed = 0
-    async for chunk in client.iter_download(
-        message,
-        request_size=min(512 * 1024, PIECE_LENGTH),
-        chunk_size=min(512 * 1024, PIECE_LENGTH),
-    ):
-        piece_buffer.extend(chunk)
-        while len(piece_buffer) >= PIECE_LENGTH:
-            hashes.extend(hashlib.sha1(piece_buffer[:PIECE_LENGTH]).digest())
-            del piece_buffer[:PIECE_LENGTH]
-            completed += PIECE_LENGTH
-            if completed and completed % (PIECE_LENGTH * 32) == 0:
-                logger.info("Torrent hashing progress: %s/%s", format_size(completed), format_size(size))
-    if piece_buffer:
-        hashes.extend(hashlib.sha1(piece_buffer).digest())
+    downloaded = 0
+    temporary = cache_path.with_suffix(cache_path.suffix + ".part") if cache_path else None
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_context = (
+            temporary.open("wb") if temporary else nullcontext(_NullWriter())
+        )
+        with cache_context as cache:
+            async for chunk in client.iter_download(
+                message,
+                request_size=min(1024 * 1024, PIECE_LENGTH),
+                chunk_size=min(1024 * 1024, PIECE_LENGTH),
+            ):
+                cache.write(chunk)
+                downloaded += len(chunk)
+                piece_buffer.extend(chunk)
+                while len(piece_buffer) >= PIECE_LENGTH:
+                    hashes.extend(hashlib.sha1(piece_buffer[:PIECE_LENGTH]).digest())
+                    del piece_buffer[:PIECE_LENGTH]
+                    completed += PIECE_LENGTH
+                    if completed and completed % (PIECE_LENGTH * 32) == 0:
+                        logger.info(
+                            "Torrent generation progress: %s/%s",
+                            format_size(completed),
+                            format_size(size),
+                        )
+        if piece_buffer:
+            hashes.extend(hashlib.sha1(piece_buffer).digest())
+        if downloaded != size:
+            raise RuntimeError(
+                f"Telegram download size mismatch: expected {size}, received {downloaded}"
+            )
+        if temporary:
+            temporary.replace(cache_path)
+    except Exception:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+        raise
     return bytes(hashes)
+
+
+class _NullWriter:
+    def write(self, _: bytes) -> None:
+        return None
 
 
 async def build_torrent(record: dict[str, Any]) -> None:
@@ -192,7 +226,10 @@ async def build_torrent(record: dict[str, Any]) -> None:
         message = await client.get_messages(BIN_CHANNEL_ID, ids=record["channel_message_id"])
         if not message:
             raise RuntimeError("The forwarded channel message no longer exists")
-        pieces = await hash_telegram_file(message, int(record["size"]))
+        cache_path = (
+            SEED_PATH / public_id / record["file_name"] if SEED_ENABLED else None
+        )
+        pieces = await hash_telegram_file(message, int(record["size"]), cache_path)
         torrent_bytes, info_hash, magnet = make_torrent_bytes(
             record["file_name"], int(record["size"]), pieces
         )
@@ -251,6 +288,7 @@ class SeedHandle:
 seed_session: Any = None
 seed_handles: dict[str, SeedHandle] = {}
 seed_tasks: dict[str, asyncio.Task[None]] = {}
+seed_slots: asyncio.Semaphore | None = None
 
 
 def get_seed_session() -> Any:
@@ -279,8 +317,6 @@ async def seed_file(record: dict[str, Any]) -> None:
         raise RuntimeError("Torrent metadata is not ready yet")
     if public_id in seed_handles:
         return
-    if len(seed_handles) >= SEED_MAX_ACTIVE:
-        raise RuntimeError(f"SEED_MAX_ACTIVE={SEED_MAX_ACTIVE} has been reached")
 
     channel_message = await client.get_messages(BIN_CHANNEL_ID, ids=record["channel_message_id"])
     if not channel_message or not channel_message.file:
@@ -333,7 +369,11 @@ async def start_seed(record: dict[str, Any]) -> None:
             {"$set": {"seed_status": "starting", "seed_error": None}},
         )
         try:
-            await seed_file(record)
+            if seed_slots is None:
+                await seed_file(record)
+            else:
+                async with seed_slots:
+                    await seed_file(record)
         except Exception as exc:
             logger.exception("Seeding failed for %s", public_id)
             seed_handles.pop(public_id, None)
@@ -547,7 +587,7 @@ files: Any = None
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    global mongo_client, db, files
+    global mongo_client, db, files, seed_slots
     validate_configuration()
     mongo_client = AsyncIOMotorClient(MONGODB_URI, serverSelectionTimeoutMS=10_000)
     db = mongo_client[MONGODB_DATABASE]
@@ -556,8 +596,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await files.create_index("channel_message_id", unique=True)
     await mongo_client.admin.command("ping")
     await client.start(bot_token=BOT_TOKEN)
+    if SEED_MAX_ACTIVE > 0:
+        seed_slots = asyncio.Semaphore(SEED_MAX_ACTIVE)
     if SEED_ENABLED:
-        cursor = files.find({"torrent_status": "ready"}).sort("created_at", 1).limit(SEED_MAX_ACTIVE)
+        cursor = files.find({"torrent_status": "ready"}).sort("created_at", 1)
         async for record in cursor:
             await start_seed(record)
     logger.info("Bot and HTTP server are ready")
